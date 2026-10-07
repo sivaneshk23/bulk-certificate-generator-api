@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system fonts
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-core fonts-noto-cjk
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile
+        run: python -m compileall -q app tests alembic
+
+      - name: Tests
+        run: pytest -q -m "not integration"
+
+      - name: Lint
+        run: ruff check .
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: certificates
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d certificates"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system fonts
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-core fonts-noto-cjk
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run PostgreSQL migrations
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/certificates
+          REDIS_URL: redis://localhost:6379/0
+          PROCESSING_MODE: sync
+        run: alembic upgrade head
+
+      - name: Verify migration state
+        env:
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/certificates
+        run: alembic current
+
+      - name: Run live PostgreSQL migration test
+        env:
+          TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/certificates
+        run: pytest -q tests/test_postgres_migration.py
+
+  docker-integration:
+    runs-on: ubuntu-latest
+    needs: [quality, integration]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and start Docker Compose stack
+        run: docker compose up -d --build
+
+      - name: Wait for API
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://localhost:8000/health > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose ps
+          docker compose logs --no-color
+          exit 1
+
+      - name: Exercise real async bulk generation
+        run: |
+          set -euo pipefail
+          payload='{"certificate":{"title":"Certificate of Completion","course_name":"Backend Engineering","completion_date":"2026-10-07","issuer_name":"Example Institute","issuer_designation":"Program Director"},"recipients":[{"name":"Alice Johnson","email":"alice@example.com"},{"name":"张伟","email":"zhang@example.com"},{"name":"சிவனேஷ் குமார்","email":"sivanesh@example.com"}]}'
+          response=$(curl --fail --silent --show-error -X POST http://localhost:8000/api/v1/generation-jobs -H 'Content-Type: application/json' -d "$payload")
+          echo "$response"
+          job_id=$(echo "$response" | jq -r '.job_id')
+          test -n "$job_id"
+
+          for attempt in $(seq 1 60); do
+            status=$(curl --fail --silent --show-error "http://localhost:8000/api/v1/generation-jobs/$job_id")
+            echo "$status"
+            state=$(echo "$status" | jq -r '.status')
+            if [ "$state" = "completed" ] || [ "$state" = "completed_with_errors" ]; then
+              completed=$(echo "$status" | jq -r '.completed')
+              failed=$(echo "$status" | jq -r '.failed')
+              test "$completed" = "3"
+              test "$failed" = "0"
+              break
+            fi
+            sleep 1
+          done
+
+          results=$(curl --fail --silent --show-error "http://localhost:8000/api/v1/generation-jobs/$job_id/certificates")
+          certificate_id=$(echo "$results" | jq -r '.items[] | select(.status == "completed") | .id' | head -1)
+          test -n "$certificate_id"
+          curl --fail --silent --show-error "http://localhost:8000/api/v1/certificates/$certificate_id/download" --output /tmp/certificate.pdf
+          test "$(head -c 4 /tmp/certificate.pdf)" = "%PDF"
+
+      - name: Show Docker logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
